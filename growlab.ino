@@ -8,6 +8,8 @@
 #define PH_PIN      A1
 #define PUMP_PIN    7
 #define FLOAT_PIN   6
+#define LED_PIN     5
+#define PH_PWR_PIN  4
 
 // NEMA17
 #define DIR_PIN     8
@@ -20,23 +22,26 @@
 #define EN23_PIN    12
 
 // --- 타이밍 ---
-const unsigned long DHT_INTERVAL           = 2000UL;
-const unsigned long TDS_SAMPLE_INTERVAL    = 200UL;
-const unsigned long TDS_COMPUTE_INTERVAL   = 3000UL;
-const unsigned long PH_INTERVAL            = 1000UL;
-const unsigned long PUMP_SETTLE            = 1000UL;
-const unsigned long FLOAT_CHECK_INTERVAL   = 30000UL;
+const unsigned long SENSOR_INTERVAL      = 60000UL;
+const unsigned long TDS_SAMPLE_INTERVAL  = 200UL;
+const unsigned long PUMP_SETTLE          = 1000UL;
+const unsigned long FLOAT_CHECK_INTERVAL = 30000UL;
 
 const int TDS_SCOUNT = 15;
 const int PH_SCOUNT  = 5;
 
 // --- 시퀀스 상수 ---
 const int           MOVES_PER_DIR = 3;
-const long          M17_STEP      = 50000L;
-const long          M23_STEP      = 200L;
+const long          M17_STEP_A    = 150000L;
+const long          M17_STEP_B    = 75000L;
+const long          M23_STEP      = 4000L;   // ✅ 1/16 마이크로스텝 기준으로 수정 (1000 → 4000)
 const unsigned long M17_WAIT      = 10000UL;
 
-// --- 필터 상수 ---
+const long M17_POS_P1[3] = { 50000L, 75000L, 100000L };
+const long M17_POS_P2[3] = { 75000L, 50000L,   5000L };
+const long M17_POS_P3[3] = { 50000L, 75000L, 100000L };
+
+// --- 센서 정상 범위 필터 ---
 const float DHT_TEMP_MIN = -10.0f;
 const float DHT_TEMP_MAX =  60.0f;
 const float DHT_HUM_MIN  =   0.0f;
@@ -48,11 +53,15 @@ const float TDS_MIN      =   0.0f;
 const float TDS_MAX      = 1000.0f;
 const float TDS_DELTA    =  80.0f;
 
-bool startupDone = true;
-
-const int SENSOR_WARMUP_COUNT = 5;
-int phWarmup  = 0;
-int tdsWarmup = 0;
+// --- 이상값 알림 임계값 ---
+const float ALERT_TEMP_MIN =  15.0f;
+const float ALERT_TEMP_MAX =  30.0f;
+const float ALERT_HUM_MIN  =  30.0f;
+const float ALERT_HUM_MAX  =  90.0f;
+const float ALERT_PH_MIN   =   5.0f;
+const float ALERT_PH_MAX   =   7.5f;
+const float ALERT_TDS_MIN  = 200.0f;
+const float ALERT_TDS_MAX  = 800.0f;
 
 float lastValidTemp = 25.0f;
 float lastValidHum  = 50.0f;
@@ -93,10 +102,11 @@ unsigned long pumpToggleTime  = 0;
 int           lastFloatState  = -1;
 unsigned long lastFloatCheck  = 0;
 
-unsigned long lastDHT        = 0;
-unsigned long lastTDSCompute = 0;
-unsigned long tdsLastSample  = 0;
-unsigned long lastPH         = 0;
+unsigned long lastSensor    = 0;
+unsigned long tdsLastSample = 0;
+
+bool ledState = false;
+bool waterOK  = false;
 
 // -----------------------------------------------
 int getMedianNum(int* arr, int len) {
@@ -120,6 +130,64 @@ float getSmoothedPH(float newVal) {
   return (len > 0) ? phRunningSum / len : newVal;
 }
 
+void checkAlert(float temp, float hum, float ph, float tds) {
+  if (temp < ALERT_TEMP_MIN || temp > ALERT_TEMP_MAX) {
+    Serial.print(F("[ALERT] TEMP:")); Serial.println(temp, 1);
+  }
+  if (hum < ALERT_HUM_MIN || hum > ALERT_HUM_MAX) {
+    Serial.print(F("[ALERT] HUM:")); Serial.println(hum, 1);
+  }
+  if (ph < ALERT_PH_MIN || ph > ALERT_PH_MAX) {
+    Serial.print(F("[ALERT] PH:")); Serial.println(ph, 2);
+  }
+  if (tds < ALERT_TDS_MIN || tds > ALERT_TDS_MAX) {
+    Serial.print(F("[ALERT] TDS:")); Serial.println(tds, 0);
+  }
+}
+
+void readAndPrintSensors() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  bool tempOK = !isnan(t) && t >= DHT_TEMP_MIN && t <= DHT_TEMP_MAX;
+  bool humOK  = !isnan(h) && h >= DHT_HUM_MIN  && h <= DHT_HUM_MAX;
+  if (tempOK && humOK) {
+    lastValidTemp = t;
+    lastValidHum  = h;
+    c_temp = t;
+  }
+
+  if (!pumpJustToggled) {
+    float voltage     = getMedianNum(analogBuffer, TDS_SCOUNT) * 5.0 / 1024.0;
+    float compVoltage = voltage / (1.0 + 0.02 * (c_temp - 25.0));
+    float tds = (133.42 * pow(compVoltage,3)
+               - 255.86 * pow(compVoltage,2)
+               + 857.39 * compVoltage) * 0.5;
+    if (tds >= TDS_MIN && tds <= TDS_MAX && fabs(tds - lastValidTDS) <= TDS_DELTA) {
+      lastValidTDS = tds;
+    }
+  }
+
+  if (!pumpJustToggled) {
+    float voltage = analogRead(PH_PIN) * 5.0 / 1024.0;
+    float raw = 2.50 + (7.00 - 2.50) / (0.918 - 0.568) * (voltage - 0.568);
+    raw += (c_temp - 25.0f) * (-0.03f);
+    if (raw >= PH_MIN && raw <= PH_MAX && fabs(raw - lastValidPH) <= PH_DELTA) {
+      lastValidPH = raw;
+      getSmoothedPH(raw);
+    }
+  }
+
+  Serial.print(F("[DATA] "));
+  Serial.print(F("T:"));      Serial.print(lastValidTemp, 1);
+  Serial.print(F(",H:"));     Serial.print(lastValidHum,  1);
+  Serial.print(F(",PH:"));    Serial.print(lastValidPH,   2);
+  Serial.print(F(",TDS:"));   Serial.print(lastValidTDS,  0);
+  Serial.print(F(",LED:"));   Serial.print(ledState ? 1 : 0);
+  Serial.print(F(",WATER:")); Serial.println(waterOK ? 1 : 0);
+
+  checkAlert(lastValidTemp, lastValidHum, lastValidPH, lastValidTDS);
+}
+
 void startSequence() {
   sensorActive  = false;
   moveCount     = 0;
@@ -127,10 +195,9 @@ void startSequence() {
   stepper17.setCurrentPosition(0);
   stepper23.setCurrentPosition(0);
   digitalWrite(EN_PIN, LOW);
-  stepper17.moveTo(M17_STEP);
+  stepper17.moveTo(M17_POS_P1[0]);
   seqState = P1_M17_MOVE;
-  Serial.println(F("\n[SEQ] === 시퀀스 시작 | 센서 중지 ==="));
-  Serial.println(F("[Phase1] M17 전진 1회 시작..."));
+  Serial.println(F("[SEQ] START"));
 }
 
 // -----------------------------------------------
@@ -143,11 +210,17 @@ void setup() {
   pinMode(FLOAT_PIN, INPUT_PULLUP);
   digitalWrite(PUMP_PIN, LOW);
 
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
   pinMode(EN_PIN,   OUTPUT);
   digitalWrite(EN_PIN, HIGH);
 
   pinMode(EN23_PIN, OUTPUT);
   digitalWrite(EN23_PIN, HIGH);
+
+  pinMode(PH_PWR_PIN, OUTPUT);
+  digitalWrite(PH_PWR_PIN, LOW);
 
   phFull = false;
   phIndex = 0;
@@ -158,32 +231,46 @@ void setup() {
   stepper17.setAcceleration(1000);
   stepper17.setCurrentPosition(0);
 
-  stepper23.setMaxSpeed(800);
-  stepper23.setAcceleration(400);
+  stepper23.setMaxSpeed(800);        // ✅ 1/16 기준 동일 RPM 유지 (200 → 800)
+  stepper23.setAcceleration(400);    // ✅ 가속도 비례 조정 (100 → 400)
   stepper23.setCurrentPosition(0);
 
-  Serial.println(F("=== GrowLab 시작 ==="));
-  Serial.println(F("[SYSTEM] 즉시 시작"));
-  Serial.println(F("-------------------"));
+  Serial.println(F("=== GrowLab START ==="));
+  delay(30000);
+  digitalWrite(PH_PWR_PIN, HIGH);
+  delay(3000);
+  Serial.println(F("[SYSTEM] Ready"));
 }
 
 // -----------------------------------------------
 void loop() {
   unsigned long now = millis();
 
+  // --- Serial 명령 수신 ---
   if (Serial.available()) {
     char c = Serial.read();
     if (c == 'p' && seqState == IDLE) startSequence();
+    else if (c == 'O') {
+      ledState = true;
+      digitalWrite(LED_PIN, HIGH);
+      Serial.println(F("[LED] ON"));
+    }
+    else if (c == 'o') {
+      ledState = false;
+      digitalWrite(LED_PIN, LOW);
+      Serial.println(F("[LED] OFF"));
+    }
   }
 
+  // --- 시퀀스 상태머신 ---
   switch (seqState) {
     case IDLE: break;
 
     case P1_M17_MOVE:
       if (stepper17.distanceToGo() != 0) { stepper17.run(); }
       else {
-        waitStart = millis(); seqState = P1_M17_WAIT;
-        Serial.print(F("[Phase1] M17 전진 ")); Serial.print(moveCount+1); Serial.println(F("회 완료. 대기..."));
+        waitStart = millis();
+        seqState  = P1_M17_WAIT;
       }
       break;
 
@@ -191,12 +278,14 @@ void loop() {
       if (millis() - waitStart >= M17_WAIT) {
         moveCount++;
         if (moveCount < MOVES_PER_DIR) {
-          stepper17.moveTo(M17_STEP * (moveCount+1)); seqState = P1_M17_MOVE;
-          Serial.print(F("[Phase1] M17 전진 ")); Serial.print(moveCount+1); Serial.println(F("회 시작..."));
+          stepper17.moveTo(M17_POS_P1[moveCount]);
+          seqState = P1_M17_MOVE;
         } else {
-          moveCount = 0; digitalWrite(EN23_PIN, LOW);
-          stepper23.moveTo(M23_STEP); m23TotalMoved = M23_STEP; seqState = P1_M23_MOVE;
-          Serial.println(F("[Phase1] 완료 → M23 1번째 전진..."));
+          moveCount = 0;
+          digitalWrite(EN23_PIN, LOW);
+          stepper23.moveTo(M23_STEP);
+          m23TotalMoved = M23_STEP;
+          seqState = P1_M23_MOVE;
         }
       }
       break;
@@ -204,17 +293,18 @@ void loop() {
     case P1_M23_MOVE:
       if (stepper23.distanceToGo() != 0) { stepper23.run(); }
       else {
-        digitalWrite(EN23_PIN, HIGH); moveCount = 0;
-        stepper17.moveTo(M17_STEP * (MOVES_PER_DIR-1)); seqState = P2_M17_MOVE;
-        Serial.println(F("[M23-1] 완료 → [Phase2] M17 역방향 시작..."));
+        digitalWrite(EN23_PIN, HIGH);
+        moveCount = 0;
+        stepper17.moveTo(M17_POS_P2[0]);
+        seqState = P2_M17_MOVE;
       }
       break;
 
     case P2_M17_MOVE:
       if (stepper17.distanceToGo() != 0) { stepper17.run(); }
       else {
-        waitStart = millis(); seqState = P2_M17_WAIT;
-        Serial.print(F("[Phase2] M17 역방향 ")); Serial.print(moveCount+1); Serial.println(F("회 완료. 대기..."));
+        waitStart = millis();
+        seqState  = P2_M17_WAIT;
       }
       break;
 
@@ -222,13 +312,14 @@ void loop() {
       if (millis() - waitStart >= M17_WAIT) {
         moveCount++;
         if (moveCount < MOVES_PER_DIR) {
-          stepper17.moveTo(M17_STEP * (MOVES_PER_DIR-1-moveCount)); seqState = P2_M17_MOVE;
-          Serial.print(F("[Phase2] M17 역방향 ")); Serial.print(moveCount+1); Serial.println(F("회 시작..."));
+          stepper17.moveTo(M17_POS_P2[moveCount]);
+          seqState = P2_M17_MOVE;
         } else {
-          moveCount = 0; digitalWrite(EN23_PIN, LOW);
-          m23TotalMoved += M23_STEP; stepper23.moveTo(m23TotalMoved); seqState = P2_M23_MOVE;
-          Serial.print(F("[Phase2] 완료 → M23 2번째 전진 누적 "));
-          Serial.print(m23TotalMoved); Serial.println(F("스텝..."));
+          moveCount = 0;
+          digitalWrite(EN23_PIN, LOW);
+          m23TotalMoved += M23_STEP;
+          stepper23.moveTo(m23TotalMoved);
+          seqState = P2_M23_MOVE;
         }
       }
       break;
@@ -236,17 +327,18 @@ void loop() {
     case P2_M23_MOVE:
       if (stepper23.distanceToGo() != 0) { stepper23.run(); }
       else {
-        digitalWrite(EN23_PIN, HIGH); moveCount = 0;
-        stepper17.moveTo(M17_STEP); seqState = P3_M17_MOVE;
-        Serial.println(F("[M23-2] 완료 → [Phase3] M17 전진 시작..."));
+        digitalWrite(EN23_PIN, HIGH);
+        moveCount = 0;
+        stepper17.moveTo(M17_POS_P3[0]);
+        seqState = P3_M17_MOVE;
       }
       break;
 
     case P3_M17_MOVE:
       if (stepper17.distanceToGo() != 0) { stepper17.run(); }
       else {
-        waitStart = millis(); seqState = P3_M17_WAIT;
-        Serial.print(F("[Phase3] M17 전진 ")); Serial.print(moveCount+1); Serial.println(F("회 완료. 대기..."));
+        waitStart = millis();
+        seqState  = P3_M17_WAIT;
       }
       break;
 
@@ -254,13 +346,13 @@ void loop() {
       if (millis() - waitStart >= M17_WAIT) {
         moveCount++;
         if (moveCount < MOVES_PER_DIR) {
-          stepper17.moveTo(M17_STEP * (moveCount+1)); seqState = P3_M17_MOVE;
-          Serial.print(F("[Phase3] M17 전진 ")); Serial.print(moveCount+1); Serial.println(F("회 시작..."));
+          stepper17.moveTo(M17_POS_P3[moveCount]);
+          seqState = P3_M17_MOVE;
         } else {
-          moveCount = 0; digitalWrite(EN23_PIN, LOW);
-          stepper23.moveTo(0); seqState = P3_M23_HOME;
-          Serial.print(F("[Phase3] 완료 → M23 원점 복귀 "));
-          Serial.print(m23TotalMoved); Serial.println(F("스텝..."));
+          moveCount = 0;
+          digitalWrite(EN23_PIN, LOW);
+          stepper23.moveTo(0);
+          seqState = P3_M23_HOME;
         }
       }
       break;
@@ -268,100 +360,66 @@ void loop() {
     case P3_M23_HOME:
       if (stepper23.distanceToGo() != 0) { stepper23.run(); }
       else {
-        digitalWrite(EN23_PIN, HIGH); digitalWrite(EN_PIN, LOW);
-        stepper17.moveTo(0); seqState = P4_M17_DOWN;
-        Serial.println(F("[M23-HOME] 완료 → [Phase4] M17 하강..."));
+        digitalWrite(EN23_PIN, HIGH);
+        stepper17.moveTo(0);
+        seqState = P4_M17_DOWN;
       }
       break;
 
     case P4_M17_DOWN:
       if (stepper17.distanceToGo() != 0) { stepper17.run(); }
-      else { seqState = SEQ_DONE; Serial.println(F("[Phase4] M17 하강 완료!")); }
+      else {
+        seqState = SEQ_DONE;
+      }
       break;
 
     case SEQ_DONE:
-      digitalWrite(EN_PIN, HIGH); digitalWrite(EN23_PIN, HIGH);
-      sensorActive = true; seqState = IDLE;
-      Serial.println(F("[SEQ] === 완료! 센서 재개 ===\n"));
+      digitalWrite(EN_PIN,   HIGH);
+      digitalWrite(EN23_PIN, HIGH);
+      sensorActive = true;
+      seqState     = IDLE;
+      Serial.println(F("[SEQ] DONE"));
       break;
   }
 
+  // --- 펌프 안정화 타이머 ---
   if (pumpJustToggled && (millis() - pumpToggleTime >= PUMP_SETTLE)) {
     pumpJustToggled = false;
   }
 
-  // --- 온습도 ---
-  if (sensorActive && now - lastDHT >= DHT_INTERVAL) {
-    lastDHT = now;
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-    bool tempOK = !isnan(t) && t >= DHT_TEMP_MIN && t <= DHT_TEMP_MAX;
-    bool humOK  = !isnan(h) && h >= DHT_HUM_MIN  && h <= DHT_HUM_MAX;
-    if (tempOK && humOK) {
-      lastValidTemp = t; lastValidHum = h; c_temp = t;
-      Serial.print(F("[DHT11] T:")); Serial.print(t,1);
-      Serial.print(F("C H:")); Serial.print(h,1); Serial.println(F("%"));
-    } else {
-      Serial.println(F("[DHT11] 오류"));
-    }
-  }
-
-  // --- TDS 샘플링 ---
+  // --- TDS 샘플링 (200ms) ---
   if (sensorActive && !pumpJustToggled && now - tdsLastSample >= TDS_SAMPLE_INTERVAL) {
     tdsLastSample = now;
     analogBuffer[analogBufferIndex] = analogRead(TDS_PIN);
     analogBufferIndex = (analogBufferIndex + 1) % TDS_SCOUNT;
   }
 
-  // --- TDS 계산 ---
-  if (sensorActive && !pumpJustToggled && now - lastTDSCompute >= TDS_COMPUTE_INTERVAL) {
-    lastTDSCompute = now;
-    float voltage     = getMedianNum(analogBuffer, TDS_SCOUNT) * 5.0 / 1024.0;
-    float compVoltage = voltage / (1.0 + 0.02 * (c_temp - 25.0));
-    float tds = (133.42 * pow(compVoltage,3) - 255.86 * pow(compVoltage,2) + 857.39 * compVoltage) * 0.5;
-    bool tdsOK = tds >= TDS_MIN && tds <= TDS_MAX
-              && (tdsWarmup < SENSOR_WARMUP_COUNT || fabs(tds - lastValidTDS) <= TDS_DELTA);
-    if (tdsOK) {
-      if (tdsWarmup < SENSOR_WARMUP_COUNT) tdsWarmup++;
-      lastValidTDS = tds;
-      Serial.print(F("[TDS] ")); Serial.print(tds,0);
-      Serial.print(F("ppm ")); Serial.print(voltage,3); Serial.println(F("V"));
-    }
+  // --- 통합 센서 읽기 + 출력 (1분마다) ---
+  if (sensorActive && now - lastSensor >= SENSOR_INTERVAL) {
+    lastSensor = now;
+    readAndPrintSensors();
   }
 
-  // --- pH ---
-  if (sensorActive && now - lastPH >= PH_INTERVAL) {
-    lastPH = now;
-    if (!pumpJustToggled) {
-      float voltage = analogRead(PH_PIN) * 5.0 / 1024.0;
-      float raw = 2.50 + (7.00 - 2.50) / (0.918 - 0.568) * (voltage - 0.568);
-      raw += (c_temp - 25.0f) * (-0.03f);
-      bool phOK = raw >= PH_MIN && raw <= PH_MAX
-               && (phWarmup < SENSOR_WARMUP_COUNT || fabs(raw - lastValidPH) <= PH_DELTA);
-      if (phOK) {
-        if (phWarmup < SENSOR_WARMUP_COUNT) phWarmup++;
-        lastValidPH = raw;
-        float ph = getSmoothedPH(raw);
-        Serial.print(F("[pH] ")); Serial.print(ph,2);
-        Serial.print(F(" ")); Serial.print(voltage,3); Serial.println(F("V"));
-      }
-    }
-  }
-
-  // --- 플로트 스위치 + 펌프 ---
+  // --- 플로트 스위치 + 펌프 (30초마다 체크) ---
   if (now - lastFloatCheck >= FLOAT_CHECK_INTERVAL) {
     lastFloatCheck = now;
     int floatVal = digitalRead(FLOAT_PIN);
     if (floatVal != lastFloatState) {
       lastFloatState = floatVal;
-      if (floatVal == HIGH) {
-        digitalWrite(PUMP_PIN, HIGH); pumpRunning = true;
-        pumpJustToggled = true; pumpToggleTime = millis();
-        Serial.println(F("[FLOAT] 정상 → 펌프 ON"));
+      if (floatVal == LOW) {
+        waterOK = true;
+        digitalWrite(PUMP_PIN, HIGH);
+        pumpRunning     = true;
+        pumpJustToggled = true;
+        pumpToggleTime  = millis();
+        Serial.println(F("[FLOAT] OK"));
       } else {
-        digitalWrite(PUMP_PIN, LOW); pumpRunning = false;
-        pumpJustToggled = true; pumpToggleTime = millis();
-        Serial.println(F("[FLOAT] 부족 → 펌프 OFF"));
+        waterOK = false;
+        digitalWrite(PUMP_PIN, LOW);
+        pumpRunning     = false;
+        pumpJustToggled = true;
+        pumpToggleTime  = millis();
+        Serial.println(F("[FLOAT] LOW"));
       }
     }
   }
