@@ -34,12 +34,12 @@ const int PH_SCOUNT  = 5;
 const int           MOVES_PER_DIR = 3;
 const long          M17_STEP_A    = 150000L;
 const long          M17_STEP_B    = 75000L;
-const long          M23_STEP      = 4000L;   // ✅ 1/16 마이크로스텝 기준으로 수정 (1000 → 4000)
-const unsigned long M17_WAIT      = 10000UL;
+const long          M23_STEP      = 17000L;
+const unsigned long M17_WAIT      = 17000UL;
 
-const long M17_POS_P1[3] = { 50000L, 75000L, 100000L };
-const long M17_POS_P2[3] = { 75000L, 50000L,   5000L };
-const long M17_POS_P3[3] = { 50000L, 75000L, 100000L };
+const long M17_POS_P1[3] = { 50000L,  75000L, 100000L };
+const long M17_POS_P2[3] = { 75000L,  50000L,   5000L };
+const long M17_POS_P3[3] = { 50000L,  75000L, 100000L };
 
 // --- 센서 정상 범위 필터 ---
 const float DHT_TEMP_MIN = -10.0f;
@@ -54,6 +54,7 @@ const float TDS_MAX      = 1000.0f;
 const float TDS_DELTA    =  80.0f;
 
 // --- 이상값 알림 임계값 ---
+// TODO: 추후 서버 Species 테이블 기반 동적 임계값으로 교체 예정
 const float ALERT_TEMP_MIN =  15.0f;
 const float ALERT_TEMP_MAX =  30.0f;
 const float ALERT_HUM_MIN  =  30.0f;
@@ -71,6 +72,7 @@ float lastValidTDS  =  0.0f;
 enum SeqState {
   IDLE,
   P1_M17_MOVE, P1_M17_WAIT, P1_M23_MOVE,
+  P1_TOP_PHOTO_WAIT,
   P2_M17_MOVE, P2_M17_WAIT, P2_M23_MOVE,
   P3_M17_MOVE, P3_M17_WAIT, P3_M23_HOME,
   P4_M17_DOWN, SEQ_DONE
@@ -78,12 +80,11 @@ enum SeqState {
 
 SeqState      seqState      = IDLE;
 int           moveCount     = 0;
-long          m23TotalMoved = 0;
 unsigned long waitStart     = 0;
 bool          sensorActive  = true;
 
 DHT dht(DHT_PIN, DHTTYPE);
-AccelStepper stepper17(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+AccelStepper stepper17(AccelStepper::DRIVER, STEP_PIN,   DIR_PIN);
 AccelStepper stepper23(AccelStepper::DRIVER, STEP23_PIN, DIR23_PIN);
 
 int   analogBuffer[TDS_SCOUNT];
@@ -167,14 +168,12 @@ void readAndPrintSensors() {
     }
   }
 
-  if (!pumpJustToggled) {
-    float voltage = analogRead(PH_PIN) * 5.0 / 1024.0;
-    float raw = 2.50 + (7.00 - 2.50) / (0.918 - 0.568) * (voltage - 0.568);
-    raw += (c_temp - 25.0f) * (-0.03f);
-    if (raw >= PH_MIN && raw <= PH_MAX && fabs(raw - lastValidPH) <= PH_DELTA) {
-      lastValidPH = raw;
-      getSmoothedPH(raw);
-    }
+  float voltage = analogRead(PH_PIN) * 5.0 / 1024.0;
+  float raw = 2.50 + (7.00 - 2.50) / (0.918 - 0.568) * (voltage - 0.568);
+  raw += (c_temp - 25.0f) * (-0.03f);
+  if (ledState) raw -= 0.5f;   // LED 켜짐 시 광간섭 보정
+  if (raw >= PH_MIN && raw <= PH_MAX && fabs(raw - lastValidPH) <= PH_DELTA) {
+    lastValidPH = getSmoothedPH(raw);
   }
 
   Serial.print(F("[DATA] "));
@@ -189,9 +188,9 @@ void readAndPrintSensors() {
 }
 
 void startSequence() {
-  sensorActive  = false;
-  moveCount     = 0;
-  m23TotalMoved = 0;
+  sensorActive = false;
+  moveCount    = 0;
+  // m23TotalMoved 제거 — 스윕 방식은 고정 타겟(+M23_STEP, -M23_STEP)만 사용
   stepper17.setCurrentPosition(0);
   stepper23.setCurrentPosition(0);
   digitalWrite(EN_PIN, LOW);
@@ -231,8 +230,8 @@ void setup() {
   stepper17.setAcceleration(1000);
   stepper17.setCurrentPosition(0);
 
-  stepper23.setMaxSpeed(800);        // ✅ 1/16 기준 동일 RPM 유지 (200 → 800)
-  stepper23.setAcceleration(400);    // ✅ 가속도 비례 조정 (100 → 400)
+  stepper23.setMaxSpeed(1600);
+  stepper23.setAcceleration(800);
   stepper23.setCurrentPosition(0);
 
   Serial.println(F("=== GrowLab START ==="));
@@ -266,11 +265,15 @@ void loop() {
   switch (seqState) {
     case IDLE: break;
 
+    // ── P1: 50000 → 75000 → 100000 ──────────────────────────
     case P1_M17_MOVE:
       if (stepper17.distanceToGo() != 0) { stepper17.run(); }
       else {
         waitStart = millis();
         seqState  = P1_M17_WAIT;
+        if (moveCount > 0) {
+          Serial.println(F("[SEQ] PHOTO"));  // portIndex 0(75000), 1(100000)
+        }
       }
       break;
 
@@ -283,8 +286,7 @@ void loop() {
         } else {
           moveCount = 0;
           digitalWrite(EN23_PIN, LOW);
-          stepper23.moveTo(M23_STEP);
-          m23TotalMoved = M23_STEP;
+          stepper23.moveTo(M23_STEP);   // ✅ 오른쪽 먼저: 0 → +19000
           seqState = P1_M23_MOVE;
         }
       }
@@ -295,16 +297,28 @@ void loop() {
       else {
         digitalWrite(EN23_PIN, HIGH);
         moveCount = 0;
+        waitStart = millis();
+        Serial.println(F("[SEQ] PHOTO"));  // portIndex 2: M23 오른쪽 회전 후
+        seqState = P1_TOP_PHOTO_WAIT;
+      }
+      break;
+
+    case P1_TOP_PHOTO_WAIT:              // M17 하강 전 대기
+      if (millis() - waitStart >= M17_WAIT) {
         stepper17.moveTo(M17_POS_P2[0]);
         seqState = P2_M17_MOVE;
       }
       break;
 
+    // ── P2: 75000 → 50000 → 5000 ────────────────────────────
     case P2_M17_MOVE:
       if (stepper17.distanceToGo() != 0) { stepper17.run(); }
       else {
         waitStart = millis();
         seqState  = P2_M17_WAIT;
+        if (moveCount < 2) {
+          Serial.println(F("[SEQ] PHOTO"));  // portIndex 3(75000), 4(50000)
+        }
       }
       break;
 
@@ -317,8 +331,7 @@ void loop() {
         } else {
           moveCount = 0;
           digitalWrite(EN23_PIN, LOW);
-          m23TotalMoved += M23_STEP;
-          stepper23.moveTo(m23TotalMoved);
+          stepper23.moveTo(-M23_STEP);  // ✅ 왼쪽으로 스윕: +19000 → -19000 (중심 통과)
           seqState = P2_M23_MOVE;
         }
       }
@@ -334,11 +347,13 @@ void loop() {
       }
       break;
 
+    // ── P3: 50000 → 75000 → 100000 ──────────────────────────
     case P3_M17_MOVE:
       if (stepper17.distanceToGo() != 0) { stepper17.run(); }
       else {
         waitStart = millis();
         seqState  = P3_M17_WAIT;
+        Serial.println(F("[SEQ] PHOTO"));  // portIndex 5(50000), 6(75000), 7(100000)
       }
       break;
 
@@ -351,12 +366,13 @@ void loop() {
         } else {
           moveCount = 0;
           digitalWrite(EN23_PIN, LOW);
-          stepper23.moveTo(0);
+          stepper23.moveTo(0);           // ✅ 복귀: -19000 → 0
           seqState = P3_M23_HOME;
         }
       }
       break;
 
+    // ── 복귀 ─────────────────────────────────────────────────
     case P3_M23_HOME:
       if (stepper23.distanceToGo() != 0) { stepper23.run(); }
       else {
@@ -406,7 +422,7 @@ void loop() {
     int floatVal = digitalRead(FLOAT_PIN);
     if (floatVal != lastFloatState) {
       lastFloatState = floatVal;
-      if (floatVal == LOW) {
+      if (floatVal == LOW) {        // HIGH → LOW 로 변경
         waterOK = true;
         digitalWrite(PUMP_PIN, HIGH);
         pumpRunning     = true;
