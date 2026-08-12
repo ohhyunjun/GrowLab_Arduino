@@ -8,7 +8,7 @@
 #define DHTTYPE     DHT11
 #define TDS_PIN     A2
 #define PH_PIN      A1
-#define PUMP_PIN    7
+#define PUMP_PIN    3
 #define FLOAT_PIN   6
 #define LED_PIN     5
 #define PH_PWR_PIN  4
@@ -19,6 +19,8 @@
 #define EN_PIN      10
 
 // NEMA23
+// 실제 배선 기준(11=DIR, 12=EN, 13=STEP)으로 맞춤.
+// 핀 13은 R4 온보드 "L" LED와 공유되어 스텝 펄스마다 같이 깜빡이지만 기능상 무해함.
 #define DIR23_PIN   11
 #define STEP23_PIN  13
 #define EN23_PIN    12
@@ -35,26 +37,27 @@ const unsigned long RPI_RESPONSE_TIMEOUT = 60000UL;
 const int TDS_SCOUNT = 15;
 const int PH_SCOUNT  = 5;
 
-// 모터 좌표
-const int  MOVES_PER_DIR = 3;
-const long M23_STEP      = 17000L;
+const long M23_STEP = 17000L;
 
-// 기존의 검증된 안전 이동 좌표
-const long M17_POS_P1[3] = { 50000L,  75000L, 100000L };
-const long M17_POS_P2[3] = { 75000L,  50000L,   5000L };
-const long M17_POS_P3[3] = { 50000L,  75000L, 100000L };
+// --- 포트별 좌표 ---
+const long M17_START_POS  = 50000L; // port0 진입 전 시작 위치 (촬영 없음)
+const long M17_SAFETY_POS =  5000L; // port4 -> port5, NEMA23 방향 전환 전 안전 위치 (촬영 없음)
 
-/*
-포트 좌표
-port 0 = NEMA17  75000, NEMA23      0
-port 1 = NEMA17 100000, NEMA23      0
-port 2 = NEMA17 100000, NEMA23 +17000
-port 3 = NEMA17  75000, NEMA23 +17000
-port 4 = NEMA17  50000, NEMA23 +17000
-port 5 = NEMA17  50000, NEMA23 -17000
-port 6 = NEMA17  75000, NEMA23 -17000
-port 7 = NEMA17 100000, NEMA23 -17000
-*/
+struct PortCoord {
+  long m17;
+  long m23;
+};
+
+const PortCoord PORT_COORDS[8] = {
+  {  75000L,      0L }, // port 0
+  { 100000L,      0L }, // port 1
+  { 100000L,  17000L }, // port 2
+  {  75000L,  17000L }, // port 3
+  {  50000L,  17000L }, // port 4
+  {  50000L, -17000L }, // port 5
+  {  75000L, -17000L }, // port 6
+  { 100000L, -17000L }, // port 7
+};
 
 // 센서값 자체의 유효 범위
 const float DHT_TEMP_MIN = -10.0f;
@@ -68,8 +71,12 @@ const float TDS_MIN      =   0.0f;
 const float TDS_MAX      = 1000.0f;
 const float TDS_DELTA    =  80.0f;
 
-// 서버 품종 기준으로 RPi가 내려 주는 런타임 경고 범위
-// CFG 명령 전에는 NAN 상태이며, 경고를 보내지 않는다.
+// pH 보정 상수 (기준점 재설정: pH 7.0 = 0.895V 실측)
+// ⚠️ 기울기(PH_SLOPE)는 기존 값을 그대로 유지함 — 정확한 재보정을 원하면
+//    pH 4.0 또는 pH 10.0 표준액에서 전압을 한 번 더 재서 2점 보정할 것
+const float PH_V_AT_7 = 0.895f;
+const float PH_SLOPE  = 10.74f;
+
 float alertTempMin = NAN;
 float alertTempMax = NAN;
 float alertHumMin  = NAN;
@@ -81,7 +88,6 @@ float alertTdsMax  = NAN;
 
 bool cropThresholdsConfigured = false;
 
-// 상태
 float lastValidTemp = 25.0f;
 float lastValidHum  = 50.0f;
 float lastValidPH   =  7.0f;
@@ -108,12 +114,16 @@ int moveCount  = 0;
 
 unsigned long photoRequestStartedAt = 0;
 
-// RPi 명령 문자열 버퍼
-// CFG:18,25,40,70,5.5,6.5,400,800 형태를 받을 수 있도록 여유 확보
 char serialBuffer[96];
 byte serialBufferLength = 0;
 
 bool sensorActive = true;
+
+enum WarmupPhase { WARMUP_WAIT, WARMUP_PH_STABILIZE, WARMUP_DONE };
+WarmupPhase warmupPhase = WARMUP_WAIT;
+unsigned long warmupPhaseStart = 0;
+const unsigned long PH_WARMUP_MS    = 30000UL;
+const unsigned long PH_STABILIZE_MS =  3000UL;
 
 DHT dht(DHT_PIN, DHTTYPE);
 AccelStepper stepper17(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
@@ -141,23 +151,17 @@ unsigned long tdsLastSample = 0;
 bool ledState = false;
 bool waterOK  = false;
 
-// 센서 보조 함수
 int getMedianNum(int* arr, int len) {
   int buf[TDS_SCOUNT];
-
-  for (int i = 0; i < len; i++) {
-    buf[i] = arr[i];
-  }
+  for (int i = 0; i < len; i++) buf[i] = arr[i];
 
   for (int i = 1; i < len; i++) {
     int key = buf[i];
     int j = i - 1;
-
     while (j >= 0 && buf[j] > key) {
       buf[j + 1] = buf[j];
       j--;
     }
-
     buf[j + 1] = key;
   }
 
@@ -173,56 +177,39 @@ float getSmoothedPH(float newVal) {
 
   phIndex = (phIndex + 1) % PH_SCOUNT;
 
-  if (!phFull && phIndex == 0) {
-    phFull = true;
-  }
+  if (!phFull && phIndex == 0) phFull = true;
 
   int len = phFull ? PH_SCOUNT : phIndex;
   return (len > 0) ? phRunningSum / len : newVal;
 }
 
-// 품종별 경고
-// 최소·최대 중 하나가 설정돼 있지 않으면 설정된 방향만 검사한다.
 bool isOutOfRange(float value, float minValue, float maxValue) {
-  if (!isnan(minValue) && value < minValue) {
-    return true;
-  }
-
-  if (!isnan(maxValue) && value > maxValue) {
-    return true;
-  }
-
+  if (!isnan(minValue) && value < minValue) return true;
+  if (!isnan(maxValue) && value > maxValue) return true;
   return false;
 }
 
 void checkAlert(float temp, float hum, float ph, float tds) {
-  // 서버에서 품종 기준이 아직 내려오지 않았으면 경고하지 않는다.
-  if (!cropThresholdsConfigured) {
-    return;
-  }
+  if (!cropThresholdsConfigured) return;
 
   if (isOutOfRange(temp, alertTempMin, alertTempMax)) {
     Serial.print(F("[ALERT] TEMP:"));
     Serial.println(temp, 1);
   }
-
   if (isOutOfRange(hum, alertHumMin, alertHumMax)) {
     Serial.print(F("[ALERT] HUM:"));
     Serial.println(hum, 1);
   }
-
   if (isOutOfRange(ph, alertPhMin, alertPhMax)) {
     Serial.print(F("[ALERT] PH:"));
     Serial.println(ph, 2);
   }
-
   if (isOutOfRange(tds, alertTdsMin, alertTdsMax)) {
     Serial.print(F("[ALERT] TDS:"));
     Serial.println(tds, 0);
   }
 }
 
-// 센서 읽기
 void readAndPrintSensors() {
   float h = dht.readHumidity();
   float t = dht.readTemperature();
@@ -246,29 +233,37 @@ void readAndPrintSensors() {
       + 857.39f * compVoltage
     ) * 0.5f;
 
-    if (tds >= TDS_MIN &&
-        tds <= TDS_MAX &&
-        fabs(tds - lastValidTDS) <= TDS_DELTA) {
+    if (
+      tds >= TDS_MIN &&
+      tds <= TDS_MAX &&
+      (
+        lastValidTDS == 0.0f ||
+        fabs(tds - lastValidTDS) <= TDS_DELTA
+      )
+    ) {
       lastValidTDS = tds;
     }
   }
 
   float voltage = analogRead(PH_PIN) * 5.0f / 1024.0f;
 
-  float raw = 2.50f
-      + (7.00f - 2.50f) / (0.918f - 0.568f) * (voltage - 0.568f);
+  // pH 보정: 기준점(pH 7.0 = 0.895V) 기반 계산
+  float raw = 7.00f + PH_SLOPE * (voltage - PH_V_AT_7);
 
   // 수온 보정
   raw += (c_temp - 25.0f) * (-0.03f);
 
   // LED 광간섭 보정
-  if (ledState) {
-    raw -= 0.5f;
-  }
+  if (ledState) raw -= 0.2f;
 
-  if (raw >= PH_MIN &&
-      raw <= PH_MAX &&
-      fabs(raw - lastValidPH) <= PH_DELTA) {
+  if (
+    raw >= PH_MIN &&
+    raw <= PH_MAX &&
+    (
+      lastValidPH == 7.0f ||
+      fabs(raw - lastValidPH) <= PH_DELTA
+    )
+  ) {
     lastValidPH = getSmoothedPH(raw);
   }
 
@@ -283,28 +278,23 @@ void readAndPrintSensors() {
   checkAlert(lastValidTemp, lastValidHum, lastValidPH, lastValidTDS);
 }
 
-// 촬영 시퀀스 시작
 void startSequence() {
   sensorActive = false;
   activePort = -1;
   moveCount = 0;
 
-  // 실제 모터 홈 이동이 아니라 현재 위치를 원점으로 가정하는 코드
   stepper17.setCurrentPosition(0);
   stepper23.setCurrentPosition(0);
 
   digitalWrite(EN_PIN, LOW);
   digitalWrite(EN23_PIN, HIGH);
 
-  // 50000은 촬영하지 않는 시작용 이동 좌표
-  stepper17.moveTo(M17_POS_P1[0]);
+  stepper17.moveTo(M17_START_POS);
   seqState = P1_M17_MOVE;
 
   Serial.println(F("[SEQ] START"));
 }
 
-// Arduino -> RPi 사진 요청
-// RPi가 ESP32-CAM 촬영·YOLO·재촬영을 끝내기 전까지 멈춘다.
 void requestPhoto(int portIndex) {
   activePort = portIndex;
   photoRequestStartedAt = millis();
@@ -321,12 +311,10 @@ void enterCameraError(const char* reason) {
   Serial.print(F(" PORT:"));
   Serial.println(activePort);
 
-  // 홈 스위치가 없으므로 오류 상태에서 자동 이동·자동 복귀하지 않는다.
   sensorActive = true;
   seqState = CAMERA_ERROR;
 }
 
-// RPi가 NEXT:<포트>를 보냈을 때 다음 안전 이동 루트 진행
 void continueAfterPhoto() {
   int completedPort = activePort;
   activePort = -1;
@@ -334,50 +322,48 @@ void continueAfterPhoto() {
   switch (completedPort) {
     case 0:
       moveCount = 2;
-      stepper17.moveTo(M17_POS_P1[2]);
+      stepper17.moveTo(PORT_COORDS[1].m17);
       seqState = P1_M17_MOVE;
       break;
 
     case 1:
       moveCount = 0;
       digitalWrite(EN23_PIN, LOW);
-      stepper23.moveTo(M23_STEP);
+      stepper23.moveTo(PORT_COORDS[2].m23);
       seqState = P1_M23_MOVE;
       break;
 
     case 2:
       moveCount = 0;
-      stepper17.moveTo(M17_POS_P2[0]);
+      stepper17.moveTo(PORT_COORDS[3].m17);
       seqState = P2_M17_MOVE;
       break;
 
     case 3:
       moveCount = 1;
-      stepper17.moveTo(M17_POS_P2[1]);
+      stepper17.moveTo(PORT_COORDS[4].m17);
       seqState = P2_M17_MOVE;
       break;
 
     case 4:
-      // 5000은 NEMA23 방향 전환을 위한 안전 위치
       moveCount = 2;
-      stepper17.moveTo(M17_POS_P2[2]);
+      stepper17.moveTo(M17_SAFETY_POS);
       seqState = P2_M17_MOVE;
       break;
 
     case 5:
       moveCount = 1;
-      stepper17.moveTo(M17_POS_P3[1]);
+      stepper17.moveTo(PORT_COORDS[6].m17);
       seqState = P3_M17_MOVE;
       break;
 
     case 6:
       moveCount = 2;
-      stepper17.moveTo(M17_POS_P3[2]);
+      stepper17.moveTo(PORT_COORDS[7].m17);
       seqState = P3_M17_MOVE;
       break;
 
     case 7:
-      // 모든 포트 촬영 완료: NEMA23 -17000 -> 0
       moveCount = 0;
       digitalWrite(EN23_PIN, LOW);
       stepper23.moveTo(0);
@@ -390,12 +376,6 @@ void continueAfterPhoto() {
   }
 }
 
-// RPi -> Arduino 품종 기준 설정
-// CFG:온도최소,온도최대,습도최소,습도최대,pH최소,pH최대,TDS최소,TDS최대
-// 예시
-// CFG:18,25,40,70,5.5,6.5,400,800
-// 품종 기준이 없는 값은 NA 사용 가능
-// CFG:18,25,NA,NA,5.5,6.5,400,800
 bool parseConfigValue(const char* token, float* result) {
   if (strcmp(token, "NA") == 0 ||
       strcmp(token, "null") == 0 ||
@@ -405,11 +385,7 @@ bool parseConfigValue(const char* token, float* result) {
   }
 
   const char* p = token;
-
-  // 부호 허용
-  if (*p == '+' || *p == '-') {
-    p++;
-  }
+  if (*p == '+' || *p == '-') p++;
 
   bool hasDigit = false;
   bool hasDot = false;
@@ -422,15 +398,11 @@ bool parseConfigValue(const char* token, float* result) {
     } else {
       return false;
     }
-
     p++;
   }
 
-  if (!hasDigit) {
-    return false;
-  }
+  if (!hasDigit) return false;
 
-  // AVR에서는 strtof 대신 atof 사용
   *result = atof(token);
   return true;
 }
@@ -446,12 +418,10 @@ void applyCropThresholdConfig(char* payload) {
       Serial.println(F("[WARN] CFG invalid value"));
       return;
     }
-
     valueIndex++;
     token = strtok(NULL, ",");
   }
 
-  // 값이 8개가 아니거나 8개를 초과하면 적용하지 않음
   if (valueIndex != 8 || token != NULL) {
     Serial.println(F("[WARN] CFG requires 8 values"));
     return;
@@ -471,10 +441,6 @@ void applyCropThresholdConfig(char* payload) {
   Serial.println(F("[CFG] Crop thresholds updated"));
 }
 
-// RPi -> Arduino 명령
-// NEXT:5\n   : 현재 5번 포트의 촬영·검증 종료, 다음 포트 이동
-// ERROR:5\n  : RPi/ESP32-CAM 오류, 현재 위치 정지
-// CFG:...\n  : 품종별 센서 경고 기준 갱신
 void handleRpiCommand(char* command) {
   if (strncmp(command, "NEXT:", 5) == 0) {
     int portIndex = atoi(command + 5);
@@ -483,7 +449,6 @@ void handleRpiCommand(char* command) {
       Serial.println(F("[WARN] NEXT ignored: not waiting"));
       return;
     }
-
     if (portIndex != activePort) {
       Serial.println(F("[WARN] NEXT ignored: port mismatch"));
       return;
@@ -504,7 +469,6 @@ void handleRpiCommand(char* command) {
     } else {
       Serial.println(F("[WARN] ERROR ignored: port mismatch"));
     }
-
     return;
   }
 
@@ -517,18 +481,10 @@ void handleRpiCommand(char* command) {
   Serial.println(command);
 }
 
-// 시리얼 수신
-// p : 전체 촬영 시작
-// O : LED ON
-// o : LED OFF
-// NEXT:5\n
-// ERROR:5\n
-// CFG:18,25,40,70,5.5,6.5,400,800\n
 void readSerialCommands() {
   while (Serial.available()) {
     char c = (char)Serial.read();
 
-    // 기존 한 글자 제어 명령 유지
     if (serialBufferLength == 0 && c == 'p' && seqState == IDLE) {
       startSequence();
       continue;
@@ -548,9 +504,7 @@ void readSerialCommands() {
       continue;
     }
 
-    if (c == '\r') {
-      continue;
-    }
+    if (c == '\r') continue;
 
     if (c == '\n') {
       if (serialBufferLength > 0) {
@@ -558,7 +512,6 @@ void readSerialCommands() {
         handleRpiCommand(serialBuffer);
         serialBufferLength = 0;
       }
-
       continue;
     }
 
@@ -571,15 +524,22 @@ void readSerialCommands() {
   }
 }
 
-// 초기화
 void setup() {
   Serial.begin(9600);
+
+  unsigned long usbWaitStart = millis();
+  while (!Serial && millis() - usbWaitStart < 3000) {
+    ; // wait for USB CDC
+  }
+
   delay(2000);
 
   dht.begin();
 
   pinMode(PUMP_PIN, OUTPUT);
   pinMode(FLOAT_PIN, INPUT_PULLUP);
+  // 펌프 단순 ON/OFF 제어 (PWM 속도조절 없음). 시작 시 OFF.
+  // ⚠️ 배선 극성이 반대(LOW=ON)일 수 있으니 실제 동작 확인 후 필요시 반전할 것.
   digitalWrite(PUMP_PIN, LOW);
 
   pinMode(LED_PIN, OUTPUT);
@@ -609,35 +569,44 @@ void setup() {
 
   Serial.println(F("=== GrowLab START ==="));
 
-  // pH 센서 안정화
-  delay(30000);
-  digitalWrite(PH_PWR_PIN, HIGH);
-  delay(3000);
-
-  Serial.println(F("[SYSTEM] Ready"));
+  warmupPhase = WARMUP_WAIT;
+  warmupPhaseStart = millis();
 }
 
-// 메인 루프
 void loop() {
   unsigned long now = millis();
 
-  // RPi 또는 시리얼 모니터 명령 수신
+  if (warmupPhase != WARMUP_DONE) {
+    readSerialCommands();
+
+    if (warmupPhase == WARMUP_WAIT) {
+      if (now - warmupPhaseStart >= PH_WARMUP_MS) {
+        digitalWrite(PH_PWR_PIN, HIGH);
+        warmupPhase = WARMUP_PH_STABILIZE;
+        warmupPhaseStart = now;
+      }
+    } else if (warmupPhase == WARMUP_PH_STABILIZE) {
+      if (now - warmupPhaseStart >= PH_STABILIZE_MS) {
+        warmupPhase = WARMUP_DONE;
+        Serial.println(F("[SYSTEM] Ready"));
+      }
+    }
+    return;
+  }
+
   readSerialCommands();
 
-  // 카메라 이동 상태머신
   switch (seqState) {
     case IDLE:
       break;
 
-    // P1: 50000 -> 75000(port 0) -> 100000(port 1)
     case P1_M17_MOVE:
       if (stepper17.distanceToGo() != 0) {
         stepper17.run();
       } else {
         if (moveCount == 0) {
-          // 50000은 촬영하지 않는 시작 위치
           moveCount = 1;
-          stepper17.moveTo(M17_POS_P1[1]);
+          stepper17.moveTo(PORT_COORDS[0].m17);
         } else if (moveCount == 1) {
           requestPhoto(0);
         } else {
@@ -646,7 +615,6 @@ void loop() {
       }
       break;
 
-    // NEMA23: 0 -> +17000, port 2
     case P1_M23_MOVE:
       if (stepper23.distanceToGo() != 0) {
         stepper23.run();
@@ -656,7 +624,6 @@ void loop() {
       }
       break;
 
-    // P2: 75000(port 3) -> 50000(port 4) -> 5000(안전 위치)
     case P2_M17_MOVE:
       if (stepper17.distanceToGo() != 0) {
         stepper17.run();
@@ -666,30 +633,25 @@ void loop() {
         } else if (moveCount == 1) {
           requestPhoto(4);
         } else {
-          // 5000에서는 촬영하지 않음.
-          // 이 위치에서만 NEMA23을 +17000 -> -17000으로 이동.
           moveCount = 0;
           digitalWrite(EN23_PIN, LOW);
-          stepper23.moveTo(-M23_STEP);
+          stepper23.moveTo(PORT_COORDS[5].m23);
           seqState = P2_M23_MOVE;
         }
       }
       break;
 
-    // NEMA23: +17000 -> -17000
     case P2_M23_MOVE:
       if (stepper23.distanceToGo() != 0) {
         stepper23.run();
       } else {
         digitalWrite(EN23_PIN, HIGH);
-
         moveCount = 0;
-        stepper17.moveTo(M17_POS_P3[0]);
+        stepper17.moveTo(PORT_COORDS[5].m17);
         seqState = P3_M17_MOVE;
       }
       break;
 
-    // P3: 50000(port 5) -> 75000(port 6) -> 100000(port 7)
     case P3_M17_MOVE:
       if (stepper17.distanceToGo() != 0) {
         stepper17.run();
@@ -704,19 +666,16 @@ void loop() {
       }
       break;
 
-    // NEMA23: -17000 -> 0
     case P3_M23_HOME:
       if (stepper23.distanceToGo() != 0) {
         stepper23.run();
       } else {
         digitalWrite(EN23_PIN, HIGH);
-
         stepper17.moveTo(0);
         seqState = P4_M17_DOWN;
       }
       break;
 
-    // NEMA17: 100000 -> 0
     case P4_M17_DOWN:
       if (stepper17.distanceToGo() != 0) {
         stepper17.run();
@@ -725,14 +684,12 @@ void loop() {
       }
       break;
 
-    // RPi가 NEXT:<현재 포트>를 보낼 때까지 현재 좌표 유지
     case WAIT_RPI:
       if (millis() - photoRequestStartedAt >= RPI_RESPONSE_TIMEOUT) {
         enterCameraError("RPI_TIMEOUT");
       }
       break;
 
-    // 오류 시 자동 복귀·자동 재시작 금지
     case CAMERA_ERROR:
       break;
 
@@ -747,13 +704,11 @@ void loop() {
       break;
   }
 
-  // 펌프 전환 직후 TDS 안정화
   if (pumpJustToggled &&
       millis() - pumpToggleTime >= PUMP_SETTLE) {
     pumpJustToggled = false;
   }
 
-  // TDS ADC 샘플링
   if (sensorActive &&
       !pumpJustToggled &&
       now - tdsLastSample >= TDS_SAMPLE_INTERVAL) {
@@ -763,14 +718,12 @@ void loop() {
     analogBufferIndex = (analogBufferIndex + 1) % TDS_SCOUNT;
   }
 
-  // 센서 출력 및 품종별 경고: 1분마다
   if (sensorActive &&
       now - lastSensor >= SENSOR_INTERVAL) {
     lastSensor = now;
     readAndPrintSensors();
   }
 
-  // 플로트 스위치 및 펌프: 30초마다
   if (now - lastFloatCheck >= FLOAT_CHECK_INTERVAL) {
     lastFloatCheck = now;
 
@@ -779,25 +732,24 @@ void loop() {
     if (floatVal != lastFloatState) {
       lastFloatState = floatVal;
 
-      // 현재 배선 기준: LOW를 물 정상 상태로 가정
       if (floatVal == LOW) {
-        waterOK = true;
+        waterOK = true;                 // 펌프 켜짐 -> WATER: 1
 
         digitalWrite(PUMP_PIN, HIGH);
         pumpRunning = true;
         pumpJustToggled = true;
         pumpToggleTime = millis();
 
-        Serial.println(F("[FLOAT] OK"));
+        Serial.println(F("[FLOAT] LOW -> PUMP ON"));
       } else {
-        waterOK = false;
+        waterOK = false;                // 펌프 꺼짐 -> WATER: 0
 
         digitalWrite(PUMP_PIN, LOW);
         pumpRunning = false;
         pumpJustToggled = true;
         pumpToggleTime = millis();
 
-        Serial.println(F("[FLOAT] LOW"));
+        Serial.println(F("[FLOAT] OK -> PUMP OFF"));
       }
     }
   }
